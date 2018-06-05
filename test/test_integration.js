@@ -1,0 +1,160 @@
+/**
+ * Copyright 2017 Google Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+import fs from 'fs';
+import {sync as rm} from 'rimraf';
+import path from 'path';
+import HeadlessNodeServer from '../lib/HeadlessNodeServer';
+import GoldenUtils from './golden-utils';
+import puppeteer from 'puppeteer';
+import DeviceDescriptors from 'puppeteer/DeviceDescriptors';
+import helper from './lib/helper';
+import TestRunner from './TestRunner';
+import Reporter from './Reporter';
+import Matchers from './Matchers';
+import readline from 'readline';
+
+const GOLDEN_DIR = path.join(__dirname, 'golden');
+const OUTPUT_DIR = path.join(__dirname, 'output');
+
+const YELLOW_COLOR = '\x1b[33m';
+const RESET_COLOR = '\x1b[0m';
+
+const headless = (process.env.HEADLESS || 'true').trim().toLowerCase() === 'true';
+const executablePath = process.env.CHROME;
+const extensionPath = path.resolve(__dirname, '../test/assets/simple-extension');
+
+if (executablePath)
+  console.warn(`${YELLOW_COLOR}WARN: running tests with ${executablePath}${RESET_COLOR}`);
+  // Make sure the `npm install` was run after the chromium roll.
+  console.assert(fs.existsSync(puppeteer.executablePath()), `Chromium is not Downloaded. Run 'npm install' and try to re-run tests`);
+
+const slowMo = parseInt((process.env.SLOW_MO || '0').trim(), 10);
+const defaultBrowserOptions = {
+  executablePath,
+  slowMo : 0,
+  headless: false,
+  dumpio: (process.env.DUMPIO || 'false').trim().toLowerCase() === 'true',
+  args: ['--no-sandbox']
+};
+const browserWithExtensionOptions = {
+  headless: false,
+  executablePath,
+  args: [
+    '--no-sandbox',
+    '--window-size=1920,1080',
+    `--disable-extensions-except=${extensionPath}`,
+    `--load-extension=${extensionPath}`,
+  ],
+};
+const parallel = false;
+const testRunner = new TestRunner({timeout: 0, parallel});
+const {expect} = new Matchers({
+  toBeGolden: GoldenUtils.compare.bind(null, GOLDEN_DIR, OUTPUT_DIR)
+});
+const {describe, it, xit, beforeAll, afterAll, beforeEach, afterEach} = testRunner;
+
+if (fs.existsSync(OUTPUT_DIR))
+  rm(OUTPUT_DIR);
+
+console.log('Testing on Node', process.version);
+
+beforeAll(async state => {
+  const assetsPath = path.join(__dirname, '../output');
+  const cachedPath = path.join(__dirname, '../output', 'cached');
+
+  const port = 7907;
+  state.server = await HeadlessNodeServer.create(`localhost:${port}`,assetsPath, port);
+  state.server.enableHTTPCache(cachedPath);
+  state.server.PREFIX = `http://localhost:${port}`;
+  state.server.CROSS_PROCESS_PREFIX = `http://127.0.0.1:${port}`; 
+  state.server.EMPTY_PAGE = `http://localhost:${port}/empty.html`;
+
+  const httpsPort = port + 1;
+  state.httpsServer = await HeadlessNodeServer.createHTTPS(`localhost:${httpsPort}`, assetsPath, httpsPort);
+  state.httpsServer.enableHTTPCache(cachedPath);
+  state.httpsServer.PREFIX = `https://localhost:${httpsPort}`;
+  state.httpsServer.CROSS_PROCESS_PREFIX = `https://127.0.0.1:${httpsPort}`;
+  state.httpsServer.EMPTY_PAGE = `https://localhost:${httpsPort}/empty.html`;
+});
+
+afterAll(async({server, httpsServer}) => {
+  await Promise.all([
+    server.stop(),
+    httpsServer.stop(),
+  ]);
+});
+
+beforeEach(async({server, httpsServer}) => {
+  server.reset();
+  httpsServer.reset();
+});
+ 
+describe('Page', function() {
+  beforeAll(async state => {
+    state.browser = await puppeteer.launch(defaultBrowserOptions);
+  });
+
+  afterAll(async state => {
+    await state.browser.close();
+    state.browser = null;
+  });
+
+  beforeEach(async(state, test) => {
+    state.page = await state.browser.newPage();
+    const rl = require('readline').createInterface({input: state.browser.process().stderr});
+    test.output = '';
+    rl.on('line', onLine);
+    state.tearDown = () => {
+      rl.removeListener('line', onLine);
+      rl.close();
+    };
+    function onLine(line) {
+      test.output += line + '\n';
+    }
+  });
+
+  afterEach(async state => {
+    state.tearDown();
+    await state.page.close();
+    state.page = null;
+  });
+  require('./proxy_browsing.spec.js').addTests({testRunner, expect});
+});
+
+// Top-level tests that launch Browser themselves.
+//require('./puppeteer.spec.js').addTests({testRunner, expect, PROJECT_ROOT, defaultBrowserOptions});
+
+if (process.env.COVERAGE) {
+  describe('COVERAGE', function() {
+    const coverage = helper.publicAPICoverage();
+    const disabled = new Set(['page.bringToFront']);
+    if (!headless)
+      disabled.add('page.pdf');
+
+    for (const method of coverage.keys()) {
+      (disabled.has(method) ? xit : it)(`public api '${method}' should be called`, async({page, server}) => {
+        expect(coverage.get(method)).toBe(true);
+      });
+    }
+  });
+}
+
+if (process.env.CI && testRunner.hasFocusedTestsOrSuites()) {
+  console.error('ERROR: "focused" tests/suites are prohibitted on bots. Remove any "fit"/"fdescribe" declarations.');
+  process.exit(1);
+}
+
+new Reporter(testRunner);
+testRunner.run();
